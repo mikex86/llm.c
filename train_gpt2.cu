@@ -1724,7 +1724,7 @@ int main(int argc, char *argv[]) {
             float eval_acc_norm = 0.0f;
             evalloader_reset(&eval_loader);
             for (int i = 0; i < eval_loader.num_batches; i++) {
-                if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
+                if (i % 10 == 0) { printf0("evaluating HellaSwag: %d/%d\n", i, eval_loader.num_batches); }
                 evalloader_next_batch(&eval_loader);
                 gpt2_validate(&model, eval_loader.inputs, eval_loader.targets, B, T);
                 int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses);
