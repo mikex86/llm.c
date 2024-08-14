@@ -1,9 +1,10 @@
 # GPT-2 (124M) repro on FineWeb
 # 124M parameter model on 10B tokens
 # => 6 * 124e6 * 10e9 = 7.44e18 ~= 7e18 capability model
-# 18,865 steps of 524,288 tokens/step
-# on 8X A100 80GB SXM ($14/hr) steps in ~300ms/iter
-# => training time 18,865 * 300ms = 94.3 min ~= $20
+# 209,094 steps of 180,349 tokens/step
+# on 1X RTX 4090 steps in ~2728.51 ms/iter
+# => training time 209,094 * 2723.42 ms = 6.59086553 days
+# (6.59086553 * 24h * 450W) / 1000 * 0.2 $/kWh = 14.2362695448 USD
 
 make train_gpt2cu USE_CUDNN=1 PRECISION=FP16
 out_dir="log_gpt2_124M"
