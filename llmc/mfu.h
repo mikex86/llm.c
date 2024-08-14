@@ -94,7 +94,7 @@ static GPUEntry gpu_db[] = {
     {"NVIDIA H100 80GB HBM3", &HOPPER, 528, 1830}, // HBM3 = SXM5
 };
 
-float get_flops_promised(const char* device, int precision_mode) {
+float get_flops_promised(const char* device, int precision_mode, bool use_lp_accumulator) {
     /*
     This function is used to estimate the Model Flops Utilization (MFU)
     basically we have to figure out how many flops the GPU can do per second.
@@ -132,7 +132,13 @@ float get_flops_promised(const char* device, int precision_mode) {
             float value = -1.0f;
             if (precision_mode == MFUH_PRECISION_BF16) { value = perf_data->BF_16_32; }
             if (precision_mode == MFUH_PRECISION_FP32) { value = perf_data->TF_32; }
-            if (precision_mode == MFUH_PRECISION_FP16) { value = perf_data->FP_16_32; }
+            if (precision_mode == MFUH_PRECISION_FP16) {
+                if (use_lp_accumulator) {
+                    value = perf_data->FP_16_16;
+                } else {
+                    value = perf_data->FP_16_32;
+                }
+            }
 
             // we'd get here if we're e.g. trying to use BF16 on Volta GPU or something...
             if (value < 0.0f) {

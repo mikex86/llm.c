@@ -5,3 +5,5 @@ tiktoken
 transformers
 datasets
 requests
+triton
+matplotlib

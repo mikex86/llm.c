@@ -423,8 +423,8 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     int model_header[256];
     memset(model_header, 0, sizeof(model_header));
     model_header[0] = 20240326; // magic number
-    assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
-    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5; // version
+    assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16 || PRECISION_MODE == PRECISION_FP16);
+    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : (PRECISION_MODE == PRECISION_BF16 ? 5 : 7);
     model_header[2] = model->config.max_seq_len;
     model_header[3] = model->config.vocab_size;
     model_header[4] = model->config.num_layers;
@@ -702,7 +702,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // now do the forward pass
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
@@ -711,14 +711,14 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
 
-        matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        matmul_forward(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        matmul_forward(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+        matmul_forward(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -735,7 +735,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
     }
 
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    
+    matmul_forward(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream, NULL, model->gelu_fusion, false);
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -821,7 +822,10 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    
+    // We also can't use lp accumulation here because k dim is too large
+    matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream, NULL, 0, false);
+
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
@@ -1108,7 +1112,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     cudaCheck(cudaDeviceSynchronize());
 }
 
-float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
+float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt, bool use_lp_accum) {
     /*
     Estimate model flops utilization (MFU)
     ref: Section 2.1 of https://arxiv.org/pdf/2001.08361
@@ -1129,7 +1133,7 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
     size_t flops_per_step = flops_per_token * num_tokens;
     // express our flops throughput as ratio of A100 bfloat16 peak flops
     float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
-    float flops_promised = get_flops_promised(deviceProp.name, PRECISION_MODE) * 1e12f;
+    float flops_promised = get_flops_promised(deviceProp.name, PRECISION_MODE, use_lp_accum) * 1e12f;
     if(flops_promised < 0) {
         return -1.f;   // don't know
     }
@@ -1155,7 +1159,7 @@ void gpt2_free(GPT2 *model) {
 // ----------------------------------------------------------------------------
 // common init & free code for all of train/test/profile
 
-void common_start(bool override_enable_tf32 = true, bool print_device_info = true) {
+void common_start(bool override_enable_tf32 = true, bool print_device_info = true, bool use_lp_accum = false) {
 
     // get CUDA device infos
     cudaCheck(cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx));
@@ -1175,6 +1179,7 @@ void common_start(bool override_enable_tf32 = true, bool print_device_info = tru
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8 && override_enable_tf32;
     cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+    triton_matmul_lp_accum = use_lp_accum;
 
     #ifdef ENABLE_CUDNN
     create_cudnn();
@@ -1384,6 +1389,7 @@ void error_usage() {
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
     // numerics
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
+    fprintf(stderr, "  -ha <int>   Use half-precision accumulator. Doubles matmul throughput on consumer GPUs. Only available in fp16. (default=0, 1 = enabled)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
     // memory management
@@ -1429,6 +1435,7 @@ int main(int argc, char *argv[]) {
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
     int max_steps = -1;
     int override_enable_tf32 = 1;
+    bool use_lp_accum = false;
     int use_master_weights = 1;
     int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
@@ -1468,6 +1475,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'h' && argv[i][2] == 'a') { use_lp_accum = (atoi(argv[i+1]) == 1); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
@@ -1487,7 +1495,7 @@ int main(int argc, char *argv[]) {
     }
 
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
-    common_start(override_enable_tf32, false); // common init code for train/test/profile
+    common_start(override_enable_tf32, false, use_lp_accum); // common init code for train/test/profile
 
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);
@@ -1499,6 +1507,10 @@ int main(int argc, char *argv[]) {
     if (total_batch_size == -1) { total_batch_size = tokens_per_fwdbwd; }
     // in the future, we might want to set gelu fusion to 2 for SM90+ and 0 for other GPUs
     if (gelu_fusion == -1) { gelu_fusion = 0; } // (deviceProp.major >= 9) ? 2 : 0; } // in gpt2_init_common for test_gpt2cu...
+    if (use_lp_accum && PRECISION_MODE != PRECISION_FP16) {
+        use_lp_accum = false;
+        printf0("Warning: Half-precision accumulator is only available in FP16 mode. Ignoring...\n");
+    }
     // calculate the number of gradient accumulation steps from the desired total batch size
     assert(total_batch_size % tokens_per_fwdbwd == 0);
     int grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
@@ -1536,9 +1548,13 @@ int main(int argc, char *argv[]) {
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
                               : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
+    const char* accum_str = use_lp_accum ? "FP16" : "FP32";
     printf0("| device                | %-50s |\n", deviceProp.name);
-    printf0("| peak TFlops           | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE));
-    printf0("| precision             | %-50s |\n", precision_str);
+    printf0("| peak TFlops           | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE, use_lp_accum));
+    
+    char precision_strbuf[100];
+    snprintf(precision_strbuf, sizeof(precision_strbuf), "%s/%s acc", precision_str, accum_str);
+    printf0("| precision             | %-50s |\n", precision_strbuf);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // figure out if we are going to be resuming the optimization
@@ -1853,10 +1869,13 @@ int main(int argc, char *argv[]) {
             ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
             bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
-        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f, use_lp_accum);
+        printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | %.2f ms | %.1f%% %s%s MFU | %.0f tok/s\n",
                 step + 1, train_num_batches, model.mean_loss, zloss, grad_norm, zgrad, step_learning_rate,
-                time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
+                time_elapsed_ms, 100*mfu,
+                PRECISION_MODE == PRECISION_FP32 ? (override_enable_tf32 ? "tf32" : "fp32") : (PRECISION_MODE == PRECISION_BF16 ? "bf16" : "fp16"),
+                use_lp_accum ? " lpacc" : " fpacc",
+                bias_corrected_ema_tokens_per_second);
         if(log_gpu_every > 0 && (step + 1) % log_gpu_every == 0) {
             GPUUtilInfo gpu_info = get_gpu_utilization_info();
             printf0("                  compute %2.1f%% | memory: %2.1f%% | fan: %2d%% | %4d MHz / %4d MHz | %3d W / %3d W | %d°C / %d°C | %s\n",
