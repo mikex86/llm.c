@@ -771,7 +771,7 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
     return mean_loss;
 }
 
-void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
+void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step, int gradient_scale_pot) {
     if(model->grads_memory == nullptr) {
         fprintf(stderr, "Need to allocate gradients before backward");
         exit(EXIT_FAILURE);
@@ -802,7 +802,13 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
     // accumulate the losses inside acts.losses, and kick off the backward pass inside the fused classifier
     NvtxRange classifier_and_loss_range("classifier_and_loss");
-    const float dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
+
+    float scale_factor = 1.0f;
+    if (gradient_scale_pot != 0) {
+        scale_factor *= (1 << gradient_scale_pot);
+    }
+
+    const float dloss = scale_factor / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V);
     fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
@@ -1395,6 +1401,7 @@ void error_usage() {
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    fprintf(stderr, "  -gs <int>   gradient scaling factor power of two. 2 ** n = gradient scaling factor used ; 0 = disabled (default = 0)\n");
     // multi-node settings
     fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
     fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
@@ -1435,10 +1442,11 @@ int main(int argc, char *argv[]) {
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
     int max_steps = -1;
     int override_enable_tf32 = 1;
-    bool use_lp_accum = false;
+    bool use_lp_accum = false; // use half-precision accumulator, only available in fp16
     int use_master_weights = 1;
     int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
+    int grad_scaling_pot = 0; // gradient scaling factor power of two. 2 ** n = gradient scaling factor used ; 0 = disabled
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
     // multi-node settings
@@ -1491,6 +1499,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 's') { grad_scaling_pot = atoi(argv[i+1]); }
         else { error_usage(); }
     }
 
@@ -1544,6 +1553,7 @@ int main(int argc, char *argv[]) {
     printf0("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
     printf0("| gelu_fusion           | %-50d |\n", gelu_fusion);
     printf0("| recompute             | %-50d |\n", recompute);
+    printf0("| gradient scaling PoT  | %-50d |\n", grad_scaling_pot);
     printf0("+-----------------------+----------------------------------------------------+\n");
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
@@ -1833,24 +1843,52 @@ int main(int argc, char *argv[]) {
             // forward pass. note that we pass in grad_accum_steps, which scales down the loss
             gpt2_forward(&model, train_loader.inputs, B, T);
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step);
+            gpt2_backward_and_reduce(&model, train_loader.inputs, train_loader.targets, grad_accum_steps, micro_step, grad_scaling_pot);
         }
-        float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
-        // fetch the next learning rate
-        float step_learning_rate = get_learning_rate(&lr_scheduler, step);
+
+        double model_loss = (double)model.mean_loss;
+
         // calculate the gradient norm and how much we wish to scale the gradient
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
-        float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
-        // update the model parameters
-        if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
-            printf0("skipping update due to loss z-score of %f\n", zloss);
-        } else if (isfinite(zgrad) && skip_update_gradz != 0.0f && zgrad > skip_update_gradz) {
-            printf0("skipping update due to grad z-score of %f\n", zgrad);
+
+        // fetch the next learning rate
+        float step_learning_rate = get_learning_rate(&lr_scheduler, step);
+        
+        float zloss = 0.0f;
+        float zgrad = 0.0f;
+
+        bool should_skip = true;
+        if (!isfinite(model_loss) || isnan(model_loss)) {
+            printf0("skipping update due to nan/infinite loss %f\n", model_loss);
+        } else if (!isfinite(grad_norm) || isnan(grad_norm)) {
+            printf0("skipping update due to nan/infinite grad norm %f\n", grad_norm);
         } else {
-            // clip the gradient norm to a maximum value
-            float grad_clip = 1.0f;
-            float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
-            gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
+            // only enter update path if loss and grad_norm are known not to inf/nan propagate into the update_detector
+            zloss = (float)(update_detector(&loss_outlier_detector, model_loss)); // loss z-score
+
+            if (grad_scaling_pot != 0) {
+                grad_norm /= (1 << grad_scaling_pot);
+            }
+
+            zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
+            should_skip = false;
+        }
+
+        // update the model parameters
+        if (!should_skip) {
+            if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
+                printf0("skipping update due to loss z-score of %f\n", zloss);
+            } else if (isfinite(zgrad) && skip_update_gradz != 0.0f && zgrad > skip_update_gradz) {
+                printf0("skipping update due to grad z-score of %f\n", zgrad);
+            } else {
+                // clip the gradient norm to a maximum value
+                float grad_clip = 1.0f;
+                float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
+                if (grad_scaling_pot != 0) {
+                    grad_scale /= (1 << grad_scaling_pot);
+                }
+                gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
+            }
         }
         cudaCheck(cudaEventRecord(end));
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings

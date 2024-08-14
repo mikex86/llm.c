@@ -38,7 +38,10 @@ while true; do
                 -y 1 \
                 -e "d12" \
                 -ha 1 \
-                -ge 2
+                -ge 2 \
+                -gs 16 \
+                -sl 4.0 \
+                -sg 4.0 \
 
     sleep 1
 done
